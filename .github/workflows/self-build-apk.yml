@@ -1,0 +1,223 @@
+name: "Self-build APK (mirror of upstream release)"
+
+# Reproduces the official Android APK of a given upstream tag/commit, using the
+# repository's own composite actions and the same Gradle task as
+# .github/workflows/new_apk.yaml (assembleNoneRelease).
+#
+# Signing: uses repository secrets when present, otherwise generates a fresh
+# keystore for this run and uploads it as an artifact. Read the artifact note in
+# the job summary before installing a build made with a throwaway key.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit/tag to build (default: the commit this workflow runs on)"
+        required: false
+        default: ""
+      skip_licenses:
+        description: "Skip the licensee step if it fails"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-app:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      KS_B64: ${{ secrets.KEYGUARD_KS_B64 }}
+      KS_PASS: ${{ secrets.KEYGUARD_KS_PASS }}
+      KS_ALIAS: ${{ secrets.KEYGUARD_KS_ALIAS }}
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: "Show build target"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "commit=$(git rev-parse HEAD)"
+          echo "describe=$(git describe --tags --always 2>/dev/null || true)"
+          echo "appVersionName=$(sed -nE 's/^[[:space:]]*appVersionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' gradle/libs.versions.toml)"
+
+      - uses: ./.github/actions/setup_gradle
+
+      - name: "Prepare signing material"
+        shell: bash
+        run: |
+          set -euo pipefail
+          alias_name="${KS_ALIAS:-keyguard}"
+          if [ -n "${KS_B64}" ]; then
+            printf '%s' "${KS_B64}" | base64 -d > androidApp/keyguard-release.keystore
+            pass="${KS_PASS}"
+            echo "GENERATED=0" >> "$GITHUB_ENV"
+            echo "Keystore restored from repository secrets."
+          else
+            pass="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
+            keytool -genkeypair \
+              -keystore androidApp/keyguard-release.keystore \
+              -storetype PKCS12 \
+              -alias "$alias_name" \
+              -keyalg RSA -keysize 4096 -validity 10950 \
+              -storepass "$pass" -keypass "$pass" \
+              -dname "CN=Keyguard Self Build, O=Personal, C=CN"
+            printf '%s' "$pass" > "$RUNNER_TEMP/keystore-password.txt"
+            echo "GENERATED=1" >> "$GITHUB_ENV"
+            echo "No signing secrets found: generated a throwaway keystore for this run."
+          fi
+          {
+            echo "key_alias=$alias_name"
+            echo "password_store=$pass"
+            echo "password_key=$pass"
+          } > androidApp/keyguard-release.properties
+
+      - name: "Prepare google-services placeholder"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > androidApp/google-services.json <<'JSON'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "keyguard-selfbuild",
+              "storage_bucket": "keyguard-selfbuild.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
+                  "android_client_info": {
+                    "package_name": "com.artemchep.keyguard"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  { "current_key": "AIzaSyDUMMYKEYFORSELFBUILDONLY" }
+                ],
+                "services": {
+                  "appinvite_service": { "other_platform_oauth_client": [] }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          JSON
+          cat > wearApp/google-services.json < androidApp/google-services.json
+          {
+            echo ""
+            echo "versionRef=$(git rev-parse --short HEAD)"
+            echo "buildkonfig.flavor=release"
+          } >> gradle.properties
+
+      - uses: ./.github/actions/setup_android_ndk
+
+      - name: "Setup Rust toolchain"
+        uses: ./.github/actions/setup_rust
+        with:
+          targets: "aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android"
+          cache-key: android
+
+      - uses: ./.github/actions/prefetch_native
+        with:
+          profile: android
+
+      - uses: ./.github/actions/build_android_licenses
+        continue-on-error: ${{ inputs.skip_licenses }}
+        with:
+          build-flavor: "None"
+
+      - name: "Build (assembleNoneRelease)"
+        run: >-
+          ./gradlew
+          :androidApp:assembleNoneRelease
+          -Pkeyguard.nativeCargo.cargoOffline=true
+
+      - name: "Verify native bundle"
+        run: >-
+          python scripts/verify_native_bundle.py android
+          androidApp/build/outputs/apk/none/release/androidApp-none-release.apk
+
+      - name: "Checksum"
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="androidApp/build/outputs/apk/none/release/androidApp-none-release.apk"
+          ls -l "$apk"
+          sha256sum "$apk" | tee apk.sha256
+
+      - name: "Compare with the official release APK"
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          official="https://github.com/AChep/keyguard-app/releases/download/r20261109/androidApp-none-release.apk"
+          curl -sSL --retry 3 -o /tmp/official.apk "$official"
+          ours="androidApp/build/outputs/apk/none/release/androidApp-none-release.apk"
+          python - "$ours" /tmp/official.apk <<'PY'
+          import hashlib, sys, zipfile
+
+          def entry_hashes(path):
+              out = {}
+              with zipfile.ZipFile(path) as z:
+                  for name in z.namelist():
+                      if name.endswith("/"):
+                          continue
+                      out[name] = hashlib.sha256(z.read(name)).hexdigest()
+              return out
+
+          ours, official = entry_hashes(sys.argv[1]), entry_hashes(sys.argv[2])
+          shared = sorted(set(ours) & set(official))
+          same = [n for n in shared if ours[n] == official[n]]
+          diff = [n for n in shared if ours[n] != official[n]]
+          only_ours = sorted(set(ours) - set(official))
+          only_official = sorted(set(official) - set(ours))
+          print(f"entries identical: {len(same)}/{len(shared)}")
+          interesting = [n for n in diff if n.startswith(("classes", "lib/")) or n == "resources.arsc"]
+          print(f"code-bearing entries that differ: {len(interesting)}")
+          for n in interesting[:20]:
+              print("  DIFF", n)
+          print("only in ours:", only_ours[:10] or "none")
+          print("only in official:", only_official[:10] or "none")
+          PY
+
+      - name: "Upload APK"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: keyguard-selfbuild
+          path: |
+            androidApp/build/outputs/apk/none/release/*.apk
+            apk.sha256
+            androidApp/build/outputs/mapping/noneRelease/mapping.txt
+          retention-days: 30
+
+      - name: "Upload generated keystore"
+        if: env.GENERATED == '1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: signing-keystore-KEEP-IT
+          path: |
+            androidApp/keyguard-release.keystore
+            ${{ runner.temp }}/keystore-password.txt
+          retention-days: 7
+
+      - name: "Summary"
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Keyguard self-build"
+            echo ""
+            echo "- commit: \`$(git rev-parse HEAD)\`"
+            if [ "${GENERATED:-0}" = "1" ]; then
+              echo "- **New keystore generated for this run.** Download the \`signing-keystore-KEEP-IT\` artifact, then add secrets \`KEYGUARD_KS_B64\` (base64 of \`keyguard-release.keystore\`) and \`KEYGUARD_KS_PASS\` (contents of \`keystore-password.txt\`) to this repository, otherwise the next build gets a different signature and cannot update this install."
+            else
+              echo "- Signed with the keystore from repository secrets."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
