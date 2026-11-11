@@ -29,9 +29,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      KS_B64: ${{ secrets.KEYGUARD_KS_B64 }}
-      KS_PASS: ${{ secrets.KEYGUARD_KS_PASS }}
-      KS_ALIAS: ${{ secrets.KEYGUARD_KS_ALIAS }}
     steps:
       - name: "Checkout"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -49,34 +46,29 @@ jobs:
 
       - uses: ./.github/actions/setup_gradle
 
-      - name: "Prepare signing material"
+      - name: "Restore signing material from secrets"
         shell: bash
+        env:
+          KS_B64: ${{ secrets.KEYGUARD_KS_B64 }}
+          KS_PASS: ${{ secrets.KEYGUARD_KS_PASS }}
+          KS_ALIAS: ${{ secrets.KEYGUARD_KS_ALIAS }}
         run: |
           set -euo pipefail
-          alias_name="${KS_ALIAS:-keyguard}"
-          if [ -n "${KS_B64}" ]; then
-            printf '%s' "${KS_B64}" | base64 -d > androidApp/keyguard-release.keystore
-            pass="${KS_PASS}"
-            echo "GENERATED=0" >> "$GITHUB_ENV"
-            echo "Keystore restored from repository secrets."
-          else
-            pass="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
-            keytool -genkeypair \
-              -keystore androidApp/keyguard-release.keystore \
-              -storetype PKCS12 \
-              -alias "$alias_name" \
-              -keyalg RSA -keysize 4096 -validity 10950 \
-              -storepass "$pass" -keypass "$pass" \
-              -dname "CN=Keyguard Self Build, O=Personal, C=CN"
-            printf '%s' "$pass" > "$RUNNER_TEMP/keystore-password.txt"
-            echo "GENERATED=1" >> "$GITHUB_ENV"
-            echo "No signing secrets found: generated a throwaway keystore for this run."
+          if [ -z "${KS_B64}" ] || [ -z "${KS_PASS}" ]; then
+            echo "Missing KEYGUARD_KS_B64 / KEYGUARD_KS_PASS." >&2
+            echo "Refusing to build: a throwaway key here would create an APK that cannot be updated in place," >&2
+            echo "and any uploaded copy of the key would let others sign installs your device would accept." >&2
+            exit 1
           fi
+          printf '%s' "${KS_B64}" | base64 -d > androidApp/keyguard-release.keystore
+          alias_name="${KS_ALIAS:-keyguard}"
           {
             echo "key_alias=$alias_name"
-            echo "password_store=$pass"
-            echo "password_key=$pass"
+            echo "password_store=${KS_PASS}"
+            echo "password_key=${KS_PASS}"
           } > androidApp/keyguard-release.properties
+          echo "Signing keystore restored from repository secrets."
+          keytool -list -keystore androidApp/keyguard-release.keystore -storepass "${KS_PASS}" -alias "$alias_name" 2>/dev/null | head -3
 
       - name: "Prepare google-services placeholder"
         shell: bash
@@ -197,16 +189,6 @@ jobs:
             androidApp/build/outputs/mapping/noneRelease/mapping.txt
           retention-days: 30
 
-      - name: "Upload generated keystore"
-        if: env.GENERATED == '1'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: signing-keystore-KEEP-IT
-          path: |
-            androidApp/keyguard-release.keystore
-            ${{ runner.temp }}/keystore-password.txt
-          retention-days: 7
-
       - name: "Summary"
         if: always()
         shell: bash
@@ -215,9 +197,6 @@ jobs:
             echo "### Keyguard self-build"
             echo ""
             echo "- commit: \`$(git rev-parse HEAD)\`"
-            if [ "${GENERATED:-0}" = "1" ]; then
-              echo "- **New keystore generated for this run.** Download the \`signing-keystore-KEEP-IT\` artifact, then add secrets \`KEYGUARD_KS_B64\` (base64 of \`keyguard-release.keystore\`) and \`KEYGUARD_KS_PASS\` (contents of \`keystore-password.txt\`) to this repository, otherwise the next build gets a different signature and cannot update this install."
-            else
-              echo "- Signed with the keystore from repository secrets."
-            fi
+            echo "- signed with the keystore from repository secrets"
+            echo "- the keystore is never uploaded as an artifact"
           } >> "$GITHUB_STEP_SUMMARY"
